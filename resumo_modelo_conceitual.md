@@ -52,7 +52,7 @@ Representam objetos ou conceitos do mundo real sobre os quais se deseja guardar 
 Características que descrevem uma entidade. Classificam-se em:
 
 1. **Simples:** Não pode ser dividido em partes menores (ex: `Nome`, `Data_Nascimento`).
-2. **Composto:** Pode ser decomposto em subatributos (ex: `Endereço` $ightarrow$ `Rua`, `Número`, `Bairro`, `CEP`).
+2. **Composto:** Pode ser decomposto em subatributos (ex: `Endereço`, `Rua`, `Número`, `Bairro`, `CEP`).
 3. **Multivalorado:** Pode ter múltiplos valores para a mesma entidade (ex: `Telefones`, `Emails`). *No modelo relacional, vira uma tabela separada.*
 4. **Chave (Identificador):** Identifica unicamente cada registro/ocorrência. Não pode ser nulo nem repetido (ex: `CPF`, `Matrícula`, `Código`).
 5. **Derivado:** Seu valor é calculado a partir de outros atributos (ex: `Idade` derivada da `Data_Nascimento`). Evita redundância de dados.
