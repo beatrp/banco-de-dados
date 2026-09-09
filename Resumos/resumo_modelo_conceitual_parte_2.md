@@ -89,7 +89,7 @@ Permitem estruturar hierarquias entre tipos de entidades (superclasses e subclas
 - **Regras de Negócio:**
   - `DEPARTAMENTO`: Sigla, Nome, Chefe. Responsável por várias `DISCIPLINA`s.
   - `DISCIPLINA`: Código, Nome, Ementa, Bibliografia. Possui $0$ a $N$ `TURMA`s.
-  - `TURMA`: Turno, Professor. Toda turma pertence a uma disciplina e possui no mínimo 1 `ALUNO`.
+  - `TURMA`: Turno, ID. Toda turma pertence a uma disciplina e possui no mínimo 1 `ALUNO`.
   - `ALUNO`: RA, CPF, Nome, Contatos. Pode estar matriculado em várias turmas ($N:M$).
   - `FUNCIONÁRIO`: Especialização (Bibliotecário, Limpeza, Administrativo, Professor).
 
