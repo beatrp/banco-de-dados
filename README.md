@@ -33,14 +33,3 @@ Este repositório tem como objetivo organizar e centralizar materiais, exercíci
 
 Contribuições são bem-vindas. Se você quiser adicionar materiais, exercícios ou melhorias, pode abrir uma pull request ou enviar alterações diretamente no repositório.
 
-## Licença
-
-Este projeto pode ser usado para fins acadêmicos e de estudo. Caso queira definir uma licença específica, recomenda-se adicionar uma licença como MIT, GPL ou outra conforme a política da instituição ou do autor.
-
-## Autor
-
-- beatrp
-
-## Observação
-
-Este README pode ser ajustado conforme o conteúdo real do repositório. Se o projeto for expandido com aulas, exercícios ou scripts específicos, basta atualizar esta página para refletir a estrutura e os objetivos do material.
