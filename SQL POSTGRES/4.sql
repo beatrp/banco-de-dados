@@ -1,0 +1,10 @@
+CREATE TABLE cliente(
+	codigo SERIAL PRIMARY KEY,
+	nome VARCHAR(100) NOT NULL,
+	endereco VARCHAR(150) NOT NULL,
+	cidade VARCHAR(100) NOT NULL,
+	estado CHAR(2) NOT NULL,
+	email VARCHAR(150) NOT NULL,
+	cpf VARCHAR(14) UNIQUE,
+	limite_cred NUMERIC(10,2)
+);
