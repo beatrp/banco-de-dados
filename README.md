@@ -14,32 +14,6 @@ Este repositório tem como objetivo organizar e centralizar materiais, exercíci
 - Facilitar o acompanhamento do curso;
 - Servir como referência para estudos futuros.
 
-## Estrutura sugerida
-
-A estrutura do projeto pode ser organizada da seguinte forma:
-
-```text
-banco-de-dados/
-├── README.md
-├── aulas/
-│   ├── fundamentos.md
-│   ├── modelagem.md
-│   └── normalizacao.md
-├── exercicios/
-│   ├── sql-basico.sql
-│   ├── joins.sql
-│   └── atividades.md
-├── scripts/
-│   ├── criacao-bd.sql
-│   ├── inserts.sql
-│   └── consultas.sql
-├── materiais/
-│   ├── slides.pdf
-│   └── referencias.md
-└── projetos/
-    └── exemplo-projeto/
-```
-
 ## Conteúdos que podem ser adicionados
 
 - Conceitos de banco de dados;
@@ -54,19 +28,6 @@ banco-de-dados/
 - NoSQL (se o curso abordar);
 - Exercícios e projetos práticos.
 
-## Como usar este repositório
-
-1. Clone o repositório localmente;
-2. Navegue pelas pastas de acordo com o tema;
-3. Consulte os materiais teóricos e os scripts disponíveis;
-4. Pratique resolvendo os exercícios propostos;
-5. Atualize o repositório com novos conteúdos e anotações.
-
-## Exemplo de comando para clonar
-
-```bash
-git clone https://github.com/beatrp/banco-de-dados.git
-```
 
 ## Contribuição
 
