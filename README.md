@@ -14,21 +14,6 @@ Este repositório tem como objetivo organizar e centralizar materiais, exercíci
 - Facilitar o acompanhamento do curso;
 - Servir como referência para estudos futuros.
 
-## Conteúdos que podem ser adicionados
-
-- Conceitos de banco de dados;
-- Modelagem conceitual, lógica e física;
-- Modelo relacional;
-- SQL: SELECT, INSERT, UPDATE, DELETE;
-- Joins e subconsultas;
-- Normalização;
-- Integridade e chaves;
-- Transações e concorrência;
-- Índices e otimização;
-- NoSQL (se o curso abordar);
-- Exercícios e projetos práticos.
-
-
 ## Contribuição
 
 Contribuições são bem-vindas. Se você quiser adicionar materiais, exercícios ou melhorias, pode abrir uma pull request ou enviar alterações diretamente no repositório.
