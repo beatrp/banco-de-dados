@@ -1,0 +1,873 @@
+
+-- =====================================================================
+-- QRStudy - Sistema de Retirada Escolar por QR Code
+-- Script do banco de dados 
+-- SGBD: PostgreSQL 12+
+--
+
+--
+--  1) Isolamento entre escolas: aprovador, revogador, validador de
+--     documento e funcionario da portaria devem ser da MESMA escola
+--     do aluno/responsavel.
+--  2) Retirada so com aluno ATIVO, responsavel ATIVO e escola ATIVA
+--     (RF-14). Inativar aluno revoga seus QR e autorizacoes temporarias.
+--  3) Geracao de QR validada no banco (vinculo ATIVA, responsavel e aluno
+--     ativos; QR temporario nao vence depois da autorizacao).
+--  4) Vinculo fora de PENDENTE exige aprovador.
+--  5) CPF obrigatorio apenas para RESPONSAVEL (RF-12: funcionario so
+--     informa nome e e-mail). Responsavel nao tem id_escola em USUARIO.
+--  6) Placa unica por responsavel (mesmo carro para pai e mae).
+--  7) Leitura offline: se o vinculo foi revogado DEPOIS da leitura, a
+--     retirada e aceita e marcada na observacao (RNFR-08.4).
+--  8) TIMESTAMPTZ em todas as datas; e-mail unico sem diferenciar
+--     maiusculas; CNPJ so com 14 digitos; documento validado exige
+--     validador; LOG_AUDITORIA nao pode ser alterada nem apagada.
+-- =====================================================================
+
+DROP TABLE IF EXISTS LOG_AUDITORIA          CASCADE;
+DROP TABLE IF EXISTS CONSENTIMENTO          CASCADE;
+DROP TABLE IF EXISTS TOKEN_USUARIO          CASCADE;
+DROP TABLE IF EXISTS REGISTRO_RETIRADA      CASCADE;
+DROP TABLE IF EXISTS QR_CODE                CASCADE;
+DROP TABLE IF EXISTS AUTORIZACAO_TEMPORARIA CASCADE;
+DROP TABLE IF EXISTS RESPONSAVEL_ALUNO      CASCADE;
+DROP TABLE IF EXISTS DOCUMENTO_RESPONSAVEL  CASCADE;
+DROP TABLE IF EXISTS VEICULO                CASCADE;
+DROP TABLE IF EXISTS ALUNO                  CASCADE;
+DROP TABLE IF EXISTS RESPONSAVEL            CASCADE;
+DROP TABLE IF EXISTS USUARIO                CASCADE;
+DROP TABLE IF EXISTS ESCOLA                 CASCADE;
+
+-- ---------------------------------------------------------------------
+-- ESCOLA
+-- ---------------------------------------------------------------------
+CREATE TABLE ESCOLA (
+    id_escola           INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    nome_escola         VARCHAR(150) NOT NULL,
+    cnpj                CHAR(14)     NOT NULL,                  -- so digitos
+    endereco            VARCHAR(255) NOT NULL,
+    telefone            VARCHAR(20),
+    email_institucional VARCHAR(254) NOT NULL,
+    email_confirmado    BOOLEAN      NOT NULL DEFAULT FALSE,    -- RNFR-01.2
+    status_cadastro     VARCHAR(20)  NOT NULL DEFAULT 'PENDENTE', -- conferencia CNPJ/contato
+    ativo               BOOLEAN      NOT NULL DEFAULT TRUE,     -- RF-14
+    CONSTRAINT uq_escola_cnpj UNIQUE (cnpj),                    -- RNFR-01.1
+    CONSTRAINT ck_escola_cnpj CHECK (cnpj ~ '^[0-9]{14}$'),
+    CONSTRAINT ck_escola_status
+        CHECK (status_cadastro IN ('PENDENTE','APROVADA','REJEITADA'))
+);
+
+-- ---------------------------------------------------------------------
+-- USUARIO (administrador, funcionario da portaria ou responsavel)
+-- cpf: texto CRIPTOGRAFADO pela aplicacao (RNFR-02.2)
+-- cpf_hash: SHA-256 (hex, 64 chars) do CPF normalizado, com "pepper" da
+--           aplicacao, usado para checar duplicidade e buscar
+-- cpf/cpf_hash: obrigatorios so para RESPONSAVEL (RF-12 pede apenas nome
+--           e e-mail do funcionario)
+-- id_escola: obrigatorio para ADMINISTRADOR/FUNCIONARIO; nulo para
+--           RESPONSAVEL (a escola dele fica em RESPONSAVEL.id_escola)
+-- ---------------------------------------------------------------------
+CREATE TABLE USUARIO (
+    id_usuario       INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    id_escola        INTEGER,
+    nome             VARCHAR(150) NOT NULL,
+    email            VARCHAR(254) NOT NULL,
+    senha_hash       VARCHAR(255) NOT NULL,        -- bcrypt/Argon2 (RNFS-03)
+    perfil           VARCHAR(20)  NOT NULL,
+    cpf              VARCHAR(255),                 -- criptografado
+    cpf_hash         CHAR(64),
+    telefone         VARCHAR(20),
+    turno            VARCHAR(20),                  -- so FUNCIONARIO
+    ativo            BOOLEAN      NOT NULL DEFAULT TRUE,
+    tentativas_login SMALLINT     NOT NULL DEFAULT 0,   -- RNFR-13.1
+    bloqueado_ate    TIMESTAMPTZ,                       -- RNFR-13.1
+    CONSTRAINT fk_usuario_escola
+        FOREIGN KEY (id_escola) REFERENCES ESCOLA (id_escola),
+    CONSTRAINT uq_usuario_cpf_hash UNIQUE (cpf_hash),   -- RNFR-02.1
+    CONSTRAINT ck_usuario_perfil
+        CHECK (perfil IN ('ADMINISTRADOR','FUNCIONARIO','RESPONSAVEL')),
+    CONSTRAINT ck_usuario_escola
+        CHECK ((perfil = 'RESPONSAVEL' AND id_escola IS NULL)
+            OR (perfil <> 'RESPONSAVEL' AND id_escola IS NOT NULL)),
+    CONSTRAINT ck_usuario_cpf_par
+        CHECK ((cpf IS NULL) = (cpf_hash IS NULL)),
+    CONSTRAINT ck_usuario_cpf
+        CHECK (perfil <> 'RESPONSAVEL' OR cpf IS NOT NULL),
+    CONSTRAINT ck_usuario_turno
+        CHECK (turno IS NULL OR turno IN ('MANHA','TARDE','NOITE','INTEGRAL')),
+    CONSTRAINT ck_usuario_tentativas CHECK (tentativas_login >= 0)
+);
+
+-- e-mail unico sem diferenciar maiusculas de minusculas
+CREATE UNIQUE INDEX uq_usuario_email ON USUARIO (lower(email));
+
+-- ---------------------------------------------------------------------
+-- RESPONSAVEL
+-- id_escola: escola escolhida no cadastro, que recebe e analisa (RF-02)
+-- ---------------------------------------------------------------------
+CREATE TABLE RESPONSAVEL (
+    id_responsavel       INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    id_usuario           INTEGER      NOT NULL,
+    id_escola            INTEGER      NOT NULL,
+    cnh                  VARCHAR(255),             -- criptografada
+    foto                 VARCHAR(500),
+    status_aprovacao     VARCHAR(20)  NOT NULL DEFAULT 'PENDENTE',
+    motivo_rejeicao      VARCHAR(255),             -- RF-04
+    data_cadastro        TIMESTAMPTZ  NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    data_validacao       TIMESTAMPTZ,
+    id_usuario_aprovador INTEGER,
+    CONSTRAINT fk_resp_usuario
+        FOREIGN KEY (id_usuario) REFERENCES USUARIO (id_usuario),
+    CONSTRAINT fk_resp_escola
+        FOREIGN KEY (id_escola) REFERENCES ESCOLA (id_escola),
+    CONSTRAINT fk_resp_aprovador
+        FOREIGN KEY (id_usuario_aprovador) REFERENCES USUARIO (id_usuario),
+    CONSTRAINT uq_resp_usuario UNIQUE (id_usuario),
+    CONSTRAINT ck_resp_status
+        CHECK (status_aprovacao IN ('PENDENTE','APROVADO','REJEITADO')),
+    CONSTRAINT ck_resp_decisao
+        CHECK (status_aprovacao = 'PENDENTE'
+               OR (id_usuario_aprovador IS NOT NULL AND data_validacao IS NOT NULL)),
+    CONSTRAINT ck_resp_motivo
+        CHECK (status_aprovacao <> 'REJEITADO'
+               OR (motivo_rejeicao IS NOT NULL AND length(trim(motivo_rejeicao)) > 0))
+);
+
+-- ---------------------------------------------------------------------
+-- ALUNO (cpf opcional, criptografado; cpf_hash para duplicidade)
+-- ---------------------------------------------------------------------
+CREATE TABLE ALUNO (
+    id_aluno        INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    id_escola       INTEGER      NOT NULL,
+    nome_completo   VARCHAR(150) NOT NULL,
+    data_nascimento DATE         NOT NULL,
+    cpf             VARCHAR(255),
+    cpf_hash        CHAR(64),
+    serie           VARCHAR(30)  NOT NULL,
+    turma           VARCHAR(30)  NOT NULL,
+    matricula       VARCHAR(30)  NOT NULL,
+    status          VARCHAR(20)  NOT NULL DEFAULT 'ATIVO',
+    turno           VARCHAR(20)  NOT NULL,
+    foto            VARCHAR(500),
+    CONSTRAINT fk_aluno_escola
+        FOREIGN KEY (id_escola) REFERENCES ESCOLA (id_escola),
+    CONSTRAINT uq_aluno_matricula UNIQUE (id_escola, matricula),  -- RNFR-05.1
+    CONSTRAINT uq_aluno_cpf_hash  UNIQUE (cpf_hash),              -- RNFR-05.1
+    CONSTRAINT ck_aluno_cpf_par
+        CHECK ((cpf IS NULL) = (cpf_hash IS NULL)),
+    CONSTRAINT ck_aluno_status
+        CHECK (status IN ('ATIVO','INATIVO','TRANSFERIDO','FORMADO')),
+    CONSTRAINT ck_aluno_turno
+        CHECK (turno IN ('MANHA','TARDE','NOITE','INTEGRAL'))
+);
+
+-- ---------------------------------------------------------------------
+-- RESPONSAVEL_ALUNO (vinculo / autorizacao de retirada)
+-- grau_parentesco: tambem cobre quem nao e parente (ex.: motorista)
+-- Vinculo revogado nao e apagado; para reativar, faca UPDATE para ATIVA
+-- (o trigger revalida responsavel e aluno).
+-- ---------------------------------------------------------------------
+CREATE TABLE RESPONSAVEL_ALUNO (
+    id_vinculo            INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    id_responsavel        INTEGER     NOT NULL,
+    id_aluno              INTEGER     NOT NULL,
+    grau_parentesco       VARCHAR(30) NOT NULL,
+    data_vinculo          TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    status_autorizacao    VARCHAR(20) NOT NULL DEFAULT 'PENDENTE',
+    id_usuario_aprovador  INTEGER,
+    data_revogacao        TIMESTAMPTZ,              -- RF-11
+    motivo_revogacao      VARCHAR(255),             -- RF-11 / RNFR-11.3
+    id_usuario_revogador  INTEGER,                  -- RF-11 / RNFR-11.3
+    CONSTRAINT fk_vinculo_resp
+        FOREIGN KEY (id_responsavel) REFERENCES RESPONSAVEL (id_responsavel),
+    CONSTRAINT fk_vinculo_aluno
+        FOREIGN KEY (id_aluno) REFERENCES ALUNO (id_aluno),
+    CONSTRAINT fk_vinculo_aprovador
+        FOREIGN KEY (id_usuario_aprovador) REFERENCES USUARIO (id_usuario),
+    CONSTRAINT fk_vinculo_revogador
+        FOREIGN KEY (id_usuario_revogador) REFERENCES USUARIO (id_usuario),
+    CONSTRAINT uq_vinculo_resp_aluno UNIQUE (id_responsavel, id_aluno),
+    CONSTRAINT ck_vinculo_status
+        CHECK (status_autorizacao IN ('PENDENTE','ATIVA','REVOGADA')),
+    CONSTRAINT ck_vinculo_aprovacao
+        CHECK (status_autorizacao = 'PENDENTE' OR id_usuario_aprovador IS NOT NULL),
+    CONSTRAINT ck_vinculo_revogacao_datas
+        CHECK (data_revogacao IS NULL OR data_revogacao >= data_vinculo),
+    CONSTRAINT ck_vinculo_revogacao_dados
+        CHECK (status_autorizacao <> 'REVOGADA'
+               OR (data_revogacao IS NOT NULL
+                   AND id_usuario_revogador IS NOT NULL
+                   AND motivo_revogacao IS NOT NULL))
+);
+
+-- ---------------------------------------------------------------------
+-- AUTORIZACAO_TEMPORARIA (RF-15: retirada emergencial por terceiro)
+-- documento_terceiro: texto criptografado pela aplicacao
+-- Validade restrita (ex.: 4 h): definida pela aplicacao em data_expiracao
+-- ---------------------------------------------------------------------
+CREATE TABLE AUTORIZACAO_TEMPORARIA (
+    id_autorizacao       INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    id_responsavel       INTEGER      NOT NULL,   -- responsavel legal que delega
+    id_aluno             INTEGER      NOT NULL,
+    nome_terceiro        VARCHAR(150) NOT NULL,
+    documento_terceiro   VARCHAR(255) NOT NULL,
+    data_criacao         TIMESTAMPTZ  NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    data_inicio          TIMESTAMPTZ  NOT NULL,
+    data_expiracao       TIMESTAMPTZ  NOT NULL,
+    status               VARCHAR(20)  NOT NULL DEFAULT 'PENDENTE',
+    id_usuario_aprovador INTEGER,             -- administracao/portaria
+    data_aprovacao       TIMESTAMPTZ,
+    CONSTRAINT fk_atemp_resp
+        FOREIGN KEY (id_responsavel) REFERENCES RESPONSAVEL (id_responsavel),
+    CONSTRAINT fk_atemp_aluno
+        FOREIGN KEY (id_aluno) REFERENCES ALUNO (id_aluno),
+    CONSTRAINT fk_atemp_aprovador
+        FOREIGN KEY (id_usuario_aprovador) REFERENCES USUARIO (id_usuario),
+    CONSTRAINT ck_atemp_status
+        CHECK (status IN ('PENDENTE','APROVADA','REJEITADA','USADA','EXPIRADA','REVOGADA')),
+    CONSTRAINT ck_atemp_periodo CHECK (data_expiracao > data_inicio),
+    CONSTRAINT ck_atemp_aprovacao
+        CHECK (status NOT IN ('APROVADA','USADA')
+               OR (id_usuario_aprovador IS NOT NULL AND data_aprovacao IS NOT NULL))
+);
+
+-- ---------------------------------------------------------------------
+-- QR_CODE
+-- Pertence a um VINCULO (RF-07) OU a uma AUTORIZACAO_TEMPORARIA (RF-15)
+-- Validade de ate 24 h e uso unico (RNFR-07.5)
+-- token_assinado: JWT/token assinado para validacao offline (RNFR-08.4)
+-- ---------------------------------------------------------------------
+CREATE TABLE QR_CODE (
+    id_qrcode           INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    id_vinculo          INTEGER,
+    id_autorizacao      INTEGER,
+    identificador_unico VARCHAR(128) NOT NULL,
+    token_assinado      TEXT,
+    data_geracao        TIMESTAMPTZ  NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    data_expiracao      TIMESTAMPTZ  NOT NULL,
+    status              VARCHAR(20)  NOT NULL DEFAULT 'ATIVO',
+    CONSTRAINT fk_qr_vinculo
+        FOREIGN KEY (id_vinculo) REFERENCES RESPONSAVEL_ALUNO (id_vinculo),
+    CONSTRAINT fk_qr_autorizacao
+        FOREIGN KEY (id_autorizacao) REFERENCES AUTORIZACAO_TEMPORARIA (id_autorizacao),
+    CONSTRAINT uq_qr_identificador UNIQUE (identificador_unico),
+    CONSTRAINT ck_qr_origem CHECK (num_nonnulls(id_vinculo, id_autorizacao) = 1),
+    CONSTRAINT ck_qr_status
+        CHECK (status IN ('ATIVO','USADO','EXPIRADO','REVOGADO')),
+    CONSTRAINT ck_qr_datas CHECK (data_expiracao > data_geracao),
+    CONSTRAINT ck_qr_24h
+        CHECK (id_vinculo IS NULL
+               OR data_expiracao <= data_geracao + INTERVAL '24 hours')
+);
+
+-- ---------------------------------------------------------------------
+-- REGISTRO_RETIRADA
+-- Somente retiradas CONCLUIDAS (RF-08: QR invalido nao gera registro;
+-- as tentativas negadas devem ir para LOG_AUDITORIA).
+-- QR de uso unico: UNIQUE em id_qrcode (duas portarias offline lendo o
+-- mesmo QR: a segunda sincronizacao falha e deve ser tratada/logada).
+-- origem_offline / data_sincronizacao: leitura offline (RNFR-08.4)
+-- Retencao minima de 5 anos (RNFR-09.4): nao apagar; anonimizar depois.
+-- ---------------------------------------------------------------------
+CREATE TABLE REGISTRO_RETIRADA (
+    id_retirada         INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    id_qrcode           INTEGER      NOT NULL,
+    id_usuario          INTEGER      NOT NULL,     -- funcionario da portaria
+    data_hora_retirada  TIMESTAMPTZ  NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    origem_offline      BOOLEAN      NOT NULL DEFAULT FALSE,
+    data_sincronizacao  TIMESTAMPTZ  NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    status              VARCHAR(20)  NOT NULL DEFAULT 'CONCLUIDA',
+    observacao          VARCHAR(255),
+    CONSTRAINT fk_registro_qr
+        FOREIGN KEY (id_qrcode) REFERENCES QR_CODE (id_qrcode),
+    CONSTRAINT fk_registro_usuario
+        FOREIGN KEY (id_usuario) REFERENCES USUARIO (id_usuario),
+    CONSTRAINT uq_registro_qr UNIQUE (id_qrcode),
+    CONSTRAINT ck_registro_status CHECK (status IN ('CONCLUIDA')),
+    CONSTRAINT ck_registro_sync CHECK (data_sincronizacao >= data_hora_retirada)
+);
+
+-- ---------------------------------------------------------------------
+-- VEICULO (placa unica por responsavel: o mesmo carro pode ser usado
+-- por mais de um responsavel, ex.: pai e mae)
+-- ---------------------------------------------------------------------
+CREATE TABLE VEICULO (
+    id_veiculo     INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    id_responsavel INTEGER     NOT NULL,
+    placa          VARCHAR(10) NOT NULL,
+    modelo         VARCHAR(30) NOT NULL,
+    marca          VARCHAR(30) NOT NULL,
+    cor            VARCHAR(30),
+    tipo           VARCHAR(30) NOT NULL,
+    CONSTRAINT fk_veiculo_resp
+        FOREIGN KEY (id_responsavel) REFERENCES RESPONSAVEL (id_responsavel),
+    CONSTRAINT uq_veiculo_resp_placa UNIQUE (id_responsavel, placa),
+    CONSTRAINT ck_veiculo_tipo
+        CHECK (tipo IN ('CARRO','MOTO','VAN','ONIBUS','OUTRO'))
+);
+
+-- ---------------------------------------------------------------------
+-- DOCUMENTO_RESPONSAVEL (RF-03: PDF/JPG/PNG ate 20 MB)
+-- ---------------------------------------------------------------------
+CREATE TABLE DOCUMENTO_RESPONSAVEL (
+    id_documento         INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    id_responsavel       INTEGER      NOT NULL,
+    nome_arquivo         VARCHAR(255) NOT NULL,
+    caminho_arquivo      VARCHAR(500) NOT NULL,
+    tamanho_bytes        INTEGER      NOT NULL,
+    tipo                 VARCHAR(50)  NOT NULL,
+    formato              VARCHAR(20)  NOT NULL,
+    data_envio           TIMESTAMPTZ  NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    status_validacao     VARCHAR(20)  NOT NULL DEFAULT 'PENDENTE',
+    id_usuario_validador INTEGER,
+    CONSTRAINT fk_doc_resp
+        FOREIGN KEY (id_responsavel) REFERENCES RESPONSAVEL (id_responsavel),
+    CONSTRAINT fk_doc_validador
+        FOREIGN KEY (id_usuario_validador) REFERENCES USUARIO (id_usuario),
+    CONSTRAINT ck_doc_tamanho CHECK (tamanho_bytes > 0 AND tamanho_bytes <= 20971520),
+    CONSTRAINT ck_doc_formato CHECK (upper(formato) IN ('PDF','JPG','PNG')),
+    CONSTRAINT ck_doc_status
+        CHECK (status_validacao IN ('PENDENTE','VALIDADO','REJEITADO')),
+    CONSTRAINT ck_doc_validacao
+        CHECK (status_validacao = 'PENDENTE' OR id_usuario_validador IS NOT NULL)
+);
+
+-- ---------------------------------------------------------------------
+-- TOKEN_USUARIO (RF-13: recuperacao de senha e confirmacao de e-mail)
+-- Guarda apenas o HASH do token (nunca o token em texto puro)
+-- ---------------------------------------------------------------------
+CREATE TABLE TOKEN_USUARIO (
+    id_token       INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    id_usuario     INTEGER     NOT NULL,
+    tipo           VARCHAR(30) NOT NULL,
+    token_hash     CHAR(64)    NOT NULL,
+    data_criacao   TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    data_expiracao TIMESTAMPTZ NOT NULL,
+    data_uso       TIMESTAMPTZ,
+    CONSTRAINT fk_token_usuario
+        FOREIGN KEY (id_usuario) REFERENCES USUARIO (id_usuario),
+    CONSTRAINT uq_token_hash UNIQUE (token_hash),
+    CONSTRAINT ck_token_tipo
+        CHECK (tipo IN ('RECUPERACAO_SENHA','CONFIRMACAO_EMAIL')),
+    CONSTRAINT ck_token_validade CHECK (data_expiracao > data_criacao),
+    CONSTRAINT ck_token_1h       -- RNFR-13.3
+        CHECK (tipo <> 'RECUPERACAO_SENHA'
+               OR data_expiracao <= data_criacao + INTERVAL '1 hour')
+);
+
+-- ---------------------------------------------------------------------
+-- CONSENTIMENTO (LGPD, RNFS-05): consentimento do responsavel legal
+-- para o tratamento dos dados do aluno (menor de idade)
+-- ---------------------------------------------------------------------
+CREATE TABLE CONSENTIMENTO (
+    id_consentimento   INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    id_usuario         INTEGER      NOT NULL,   -- quem consentiu
+    id_aluno           INTEGER,                 -- aluno cujos dados serao tratados
+    versao_termo       VARCHAR(20)  NOT NULL,
+    finalidade         VARCHAR(255) NOT NULL,
+    data_consentimento TIMESTAMPTZ  NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    data_revogacao     TIMESTAMPTZ,
+    CONSTRAINT fk_consent_usuario
+        FOREIGN KEY (id_usuario) REFERENCES USUARIO (id_usuario),
+    CONSTRAINT fk_consent_aluno
+        FOREIGN KEY (id_aluno) REFERENCES ALUNO (id_aluno),
+    CONSTRAINT ck_consent_revogacao
+        CHECK (data_revogacao IS NULL OR data_revogacao >= data_consentimento)
+);
+
+-- ---------------------------------------------------------------------
+-- LOG_AUDITORIA
+-- id_usuario pode ser nulo: login falho, tentativa de QR invalido
+-- ou acao do proprio sistema (ex.: expiracao automatica)
+-- Nao pode ser alterada nem apagada (ver trigger 12), salvo em manutencao
+-- autorizada: SET LOCAL qrstudy.manutencao = 'on';
+-- ---------------------------------------------------------------------
+CREATE TABLE LOG_AUDITORIA (
+    id_log      INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    id_usuario  INTEGER,
+    acao        VARCHAR(50) NOT NULL,
+    entidade    VARCHAR(50) NOT NULL,
+    id_registro INTEGER,
+    data_hora   TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    detalhes    VARCHAR(500),
+    CONSTRAINT fk_log_usuario
+        FOREIGN KEY (id_usuario) REFERENCES USUARIO (id_usuario)
+);
+
+-- ---------------------------------------------------------------------
+-- INDICES
+-- ---------------------------------------------------------------------
+CREATE INDEX idx_usuario_escola     ON USUARIO (id_escola);
+CREATE INDEX idx_resp_escola_status ON RESPONSAVEL (id_escola, status_aprovacao);
+CREATE INDEX idx_aluno_escola       ON ALUNO (id_escola);
+CREATE INDEX idx_vinculo_aluno      ON RESPONSAVEL_ALUNO (id_aluno);
+CREATE INDEX idx_atemp_resp         ON AUTORIZACAO_TEMPORARIA (id_responsavel);
+CREATE INDEX idx_atemp_aluno        ON AUTORIZACAO_TEMPORARIA (id_aluno);
+CREATE INDEX idx_qr_vinculo         ON QR_CODE (id_vinculo);
+CREATE INDEX idx_qr_autorizacao     ON QR_CODE (id_autorizacao);
+CREATE INDEX idx_qr_status          ON QR_CODE (status);
+CREATE INDEX idx_registro_usuario   ON REGISTRO_RETIRADA (id_usuario);
+CREATE INDEX idx_registro_data      ON REGISTRO_RETIRADA (data_hora_retirada);
+CREATE INDEX idx_veiculo_resp       ON VEICULO (id_responsavel);
+CREATE INDEX idx_doc_resp           ON DOCUMENTO_RESPONSAVEL (id_responsavel);
+CREATE INDEX idx_token_usuario      ON TOKEN_USUARIO (id_usuario, tipo);
+CREATE INDEX idx_consent_usuario    ON CONSENTIMENTO (id_usuario);
+CREATE INDEX idx_log_usuario_data   ON LOG_AUDITORIA (id_usuario, data_hora);
+
+-- =====================================================================
+-- TRIGGERS (regras que o CHECK nao consegue validar)
+-- =====================================================================
+
+-- 1) A coluna indicada no trigger deve apontar para um ADMINISTRADOR
+--    Uso: EXECUTE FUNCTION fn_valida_admin('nome_da_coluna')
+CREATE OR REPLACE FUNCTION fn_valida_admin() RETURNS trigger AS $$
+DECLARE
+    v_id     INTEGER;
+    v_perfil VARCHAR(20);
+BEGIN
+    v_id := (to_jsonb(NEW) ->> TG_ARGV[0])::INTEGER;
+    IF v_id IS NOT NULL THEN
+        SELECT perfil INTO v_perfil FROM USUARIO WHERE id_usuario = v_id;
+        IF v_perfil IS DISTINCT FROM 'ADMINISTRADOR' THEN
+            RAISE EXCEPTION 'O usuario % (%) nao e ADMINISTRADOR', v_id, TG_ARGV[0];
+        END IF;
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_resp_aprovador
+    BEFORE INSERT OR UPDATE ON RESPONSAVEL
+    FOR EACH ROW EXECUTE FUNCTION fn_valida_admin('id_usuario_aprovador');
+
+CREATE TRIGGER trg_vinculo_aprovador
+    BEFORE INSERT OR UPDATE ON RESPONSAVEL_ALUNO
+    FOR EACH ROW EXECUTE FUNCTION fn_valida_admin('id_usuario_aprovador');
+
+CREATE TRIGGER trg_vinculo_revogador
+    BEFORE INSERT OR UPDATE ON RESPONSAVEL_ALUNO
+    FOR EACH ROW EXECUTE FUNCTION fn_valida_admin('id_usuario_revogador');
+
+CREATE TRIGGER trg_doc_validador
+    BEFORE INSERT OR UPDATE ON DOCUMENTO_RESPONSAVEL
+    FOR EACH ROW EXECUTE FUNCTION fn_valida_admin('id_usuario_validador');
+
+-- 1b) Isolamento entre escolas: quem aprova/revoga/valida deve ser da
+--     mesma escola do cadastro afetado
+CREATE OR REPLACE FUNCTION fn_valida_escola_resp() RETURNS trigger AS $$
+BEGIN
+    IF NEW.id_usuario_aprovador IS NOT NULL
+       AND (SELECT id_escola FROM USUARIO WHERE id_usuario = NEW.id_usuario_aprovador)
+           IS DISTINCT FROM NEW.id_escola THEN
+        RAISE EXCEPTION 'Aprovador pertence a outra escola';
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_resp_escola
+    BEFORE INSERT OR UPDATE ON RESPONSAVEL
+    FOR EACH ROW EXECUTE FUNCTION fn_valida_escola_resp();
+
+CREATE OR REPLACE FUNCTION fn_valida_escola_vinculo() RETURNS trigger AS $$
+DECLARE
+    v_esc INTEGER;
+BEGIN
+    SELECT id_escola INTO v_esc FROM ALUNO WHERE id_aluno = NEW.id_aluno;
+    IF NEW.id_usuario_aprovador IS NOT NULL
+       AND (SELECT id_escola FROM USUARIO WHERE id_usuario = NEW.id_usuario_aprovador)
+           IS DISTINCT FROM v_esc THEN
+        RAISE EXCEPTION 'Aprovador do vinculo pertence a outra escola';
+    END IF;
+    IF NEW.id_usuario_revogador IS NOT NULL
+       AND (SELECT id_escola FROM USUARIO WHERE id_usuario = NEW.id_usuario_revogador)
+           IS DISTINCT FROM v_esc THEN
+        RAISE EXCEPTION 'Revogador do vinculo pertence a outra escola';
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_vinculo_escola
+    BEFORE INSERT OR UPDATE ON RESPONSAVEL_ALUNO
+    FOR EACH ROW EXECUTE FUNCTION fn_valida_escola_vinculo();
+
+CREATE OR REPLACE FUNCTION fn_valida_escola_doc() RETURNS trigger AS $$
+BEGIN
+    IF NEW.id_usuario_validador IS NOT NULL
+       AND (SELECT id_escola FROM USUARIO WHERE id_usuario = NEW.id_usuario_validador)
+           IS DISTINCT FROM
+           (SELECT id_escola FROM RESPONSAVEL WHERE id_responsavel = NEW.id_responsavel) THEN
+        RAISE EXCEPTION 'Validador do documento pertence a outra escola';
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_doc_escola
+    BEFORE INSERT OR UPDATE ON DOCUMENTO_RESPONSAVEL
+    FOR EACH ROW EXECUTE FUNCTION fn_valida_escola_doc();
+
+-- 2) RESPONSAVEL.id_usuario deve ter perfil RESPONSAVEL
+CREATE OR REPLACE FUNCTION fn_valida_perfil_resp() RETURNS trigger AS $$
+BEGIN
+    IF (SELECT perfil FROM USUARIO WHERE id_usuario = NEW.id_usuario)
+       IS DISTINCT FROM 'RESPONSAVEL' THEN
+        RAISE EXCEPTION 'O usuario % nao tem perfil RESPONSAVEL', NEW.id_usuario;
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_resp_perfil
+    BEFORE INSERT OR UPDATE ON RESPONSAVEL
+    FOR EACH ROW EXECUTE FUNCTION fn_valida_perfil_resp();
+
+-- 3) Vinculo: so responsavel APROVADO e ativo, aluno ATIVO e da mesma
+--    escola que analisou o cadastro (RNFR-06.2). Vale na criacao e
+--    quando o vinculo volta a ficar ATIVA (reativacao).
+CREATE OR REPLACE FUNCTION fn_valida_vinculo() RETURNS trigger AS $$
+DECLARE
+    v_status   VARCHAR(20);
+    v_ativo    BOOLEAN;
+    v_esc_resp INTEGER;
+    v_esc_alu  INTEGER;
+    v_st_alu   VARCHAR(20);
+BEGIN
+    SELECT r.status_aprovacao, u.ativo, r.id_escola
+      INTO v_status, v_ativo, v_esc_resp
+      FROM RESPONSAVEL r JOIN USUARIO u ON u.id_usuario = r.id_usuario
+     WHERE r.id_responsavel = NEW.id_responsavel;
+
+    SELECT id_escola, status INTO v_esc_alu, v_st_alu
+      FROM ALUNO WHERE id_aluno = NEW.id_aluno;
+
+    IF v_status IS DISTINCT FROM 'APROVADO' OR NOT COALESCE(v_ativo, FALSE) THEN
+        RAISE EXCEPTION 'Responsavel % nao esta aprovado/ativo', NEW.id_responsavel;
+    END IF;
+    IF v_st_alu IS DISTINCT FROM 'ATIVO' THEN
+        RAISE EXCEPTION 'Aluno % nao esta ATIVO', NEW.id_aluno;
+    END IF;
+    IF v_esc_resp <> v_esc_alu THEN
+        RAISE EXCEPTION 'Responsavel e aluno pertencem a escolas diferentes';
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_vinculo_valida
+    BEFORE INSERT ON RESPONSAVEL_ALUNO
+    FOR EACH ROW EXECUTE FUNCTION fn_valida_vinculo();
+
+CREATE TRIGGER trg_vinculo_reativa
+    BEFORE UPDATE OF status_autorizacao ON RESPONSAVEL_ALUNO
+    FOR EACH ROW
+    WHEN (NEW.status_autorizacao = 'ATIVA' AND OLD.status_autorizacao <> 'ATIVA')
+    EXECUTE FUNCTION fn_valida_vinculo();
+
+-- 4) Autorizacao temporaria (RF-15): responsavel precisa ter vinculo ATIVO
+--    com o aluno; aprovador deve ser ADMINISTRADOR ou FUNCIONARIO da
+--    mesma escola do aluno
+CREATE OR REPLACE FUNCTION fn_valida_autorizacao_temp() RETURNS trigger AS $$
+DECLARE
+    v_perfil  VARCHAR(20);
+    v_esc_apr INTEGER;
+BEGIN
+    IF TG_OP = 'INSERT' AND NOT EXISTS (
+        SELECT 1
+          FROM RESPONSAVEL_ALUNO ra
+          JOIN RESPONSAVEL r ON r.id_responsavel = ra.id_responsavel
+          JOIN USUARIO u     ON u.id_usuario = r.id_usuario
+          JOIN ALUNO al      ON al.id_aluno = ra.id_aluno
+         WHERE ra.id_responsavel = NEW.id_responsavel
+           AND ra.id_aluno = NEW.id_aluno
+           AND ra.status_autorizacao = 'ATIVA'
+           AND u.ativo AND al.status = 'ATIVO') THEN
+        RAISE EXCEPTION 'Responsavel sem vinculo ATIVO com o aluno, ou responsavel/aluno inativo';
+    END IF;
+
+    IF NEW.id_usuario_aprovador IS NOT NULL THEN
+        SELECT perfil, id_escola INTO v_perfil, v_esc_apr FROM USUARIO
+         WHERE id_usuario = NEW.id_usuario_aprovador;
+        IF COALESCE(v_perfil, '') NOT IN ('ADMINISTRADOR','FUNCIONARIO') THEN
+            RAISE EXCEPTION 'Aprovador deve ser ADMINISTRADOR ou FUNCIONARIO';
+        END IF;
+        IF v_esc_apr IS DISTINCT FROM
+           (SELECT id_escola FROM ALUNO WHERE id_aluno = NEW.id_aluno) THEN
+            RAISE EXCEPTION 'Aprovador pertence a outra escola';
+        END IF;
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_atemp_valida
+    BEFORE INSERT OR UPDATE ON AUTORIZACAO_TEMPORARIA
+    FOR EACH ROW EXECUTE FUNCTION fn_valida_autorizacao_temp();
+
+-- 5) Quem registra a retirada deve ser FUNCIONARIO ativo (RNFR-08.1, RNFR-12.2)
+CREATE OR REPLACE FUNCTION fn_valida_funcionario() RETURNS trigger AS $$
+DECLARE
+    v_perfil VARCHAR(20);
+    v_ativo  BOOLEAN;
+BEGIN
+    SELECT perfil, ativo INTO v_perfil, v_ativo
+      FROM USUARIO WHERE id_usuario = NEW.id_usuario;
+    IF v_perfil IS DISTINCT FROM 'FUNCIONARIO' OR NOT COALESCE(v_ativo, FALSE) THEN
+        RAISE EXCEPTION 'O usuario % nao e FUNCIONARIO ativo da portaria', NEW.id_usuario;
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_registro_funcionario
+    BEFORE INSERT ON REGISTRO_RETIRADA
+    FOR EACH ROW EXECUTE FUNCTION fn_valida_funcionario();
+
+-- 6) Geracao do QR: vinculo ATIVA com responsavel e aluno ativos; QR de
+--    autorizacao temporaria nao pode vencer depois da autorizacao
+CREATE OR REPLACE FUNCTION fn_valida_qr_geracao() RETURNS trigger AS $$
+BEGIN
+    IF NEW.id_vinculo IS NOT NULL THEN
+        IF NOT EXISTS (
+            SELECT 1
+              FROM RESPONSAVEL_ALUNO ra
+              JOIN RESPONSAVEL r ON r.id_responsavel = ra.id_responsavel
+              JOIN USUARIO u     ON u.id_usuario = r.id_usuario
+              JOIN ALUNO al      ON al.id_aluno = ra.id_aluno
+             WHERE ra.id_vinculo = NEW.id_vinculo
+               AND ra.status_autorizacao = 'ATIVA'
+               AND u.ativo AND al.status = 'ATIVO') THEN
+            RAISE EXCEPTION 'Vinculo nao esta ATIVA, ou responsavel/aluno inativo';
+        END IF;
+    ELSE
+        IF NOT EXISTS (
+            SELECT 1
+              FROM AUTORIZACAO_TEMPORARIA aut
+              JOIN RESPONSAVEL r ON r.id_responsavel = aut.id_responsavel
+              JOIN USUARIO u     ON u.id_usuario = r.id_usuario
+              JOIN ALUNO al      ON al.id_aluno = aut.id_aluno
+             WHERE aut.id_autorizacao = NEW.id_autorizacao
+               AND aut.status IN ('PENDENTE','APROVADA')
+               AND NEW.data_expiracao <= aut.data_expiracao
+               AND u.ativo AND al.status = 'ATIVO') THEN
+            RAISE EXCEPTION 'Autorizacao temporaria invalida ou QR vence depois dela';
+        END IF;
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_qr_geracao
+    BEFORE INSERT ON QR_CODE
+    FOR EACH ROW EXECUTE FUNCTION fn_valida_qr_geracao();
+
+-- 7) Validacao da retirada (RNFR-08.2): QR existe, ATIVO, dentro da
+--    validade (na hora da leitura, mesmo que sincronizado depois), vinculo
+--    ATIVA ou autorizacao temporaria APROVADA dentro do periodo, aluno,
+--    responsavel e escola ativos, e funcionario da mesma escola do aluno.
+--    Excecao (RNFR-08.4): leitura OFFLINE de vinculo revogado DEPOIS da
+--    leitura e aceita e anotada em observacao.
+CREATE OR REPLACE FUNCTION fn_valida_qr_retirada() RETURNS trigger AS $$
+DECLARE
+    q           QR_CODE%ROWTYPE;
+    aut         AUTORIZACAO_TEMPORARIA%ROWTYPE;
+    v_st_vin    VARCHAR(20);
+    v_dt_rev    TIMESTAMPTZ;
+    v_id_aluno  INTEGER;
+    v_id_resp   INTEGER;
+    v_revog_dep BOOLEAN := FALSE;
+    v_esc_aluno INTEGER;
+    v_esc_func  INTEGER;
+    v_aluno_ok  BOOLEAN;
+    v_resp_ok   BOOLEAN;
+    v_escola_ok BOOLEAN;
+BEGIN
+    SELECT * INTO q FROM QR_CODE WHERE id_qrcode = NEW.id_qrcode;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'QR Code nao encontrado';
+    END IF;
+
+    IF q.id_vinculo IS NOT NULL THEN
+        SELECT status_autorizacao, data_revogacao, id_aluno, id_responsavel
+          INTO v_st_vin, v_dt_rev, v_id_aluno, v_id_resp
+          FROM RESPONSAVEL_ALUNO WHERE id_vinculo = q.id_vinculo;
+        v_revog_dep := NEW.origem_offline
+                       AND v_st_vin = 'REVOGADA'
+                       AND v_dt_rev IS NOT NULL
+                       AND v_dt_rev > NEW.data_hora_retirada;
+    ELSE
+        SELECT * INTO aut FROM AUTORIZACAO_TEMPORARIA
+         WHERE id_autorizacao = q.id_autorizacao;
+        v_id_aluno := aut.id_aluno;
+        v_id_resp  := aut.id_responsavel;
+    END IF;
+
+    IF q.status <> 'ATIVO' AND NOT (v_revog_dep AND q.status = 'REVOGADO') THEN
+        RAISE EXCEPTION 'QR Code nao esta ATIVO (status: %)', q.status;
+    END IF;
+    IF q.data_expiracao < NEW.data_hora_retirada THEN
+        RAISE EXCEPTION 'QR Code expirado';
+    END IF;
+
+    IF q.id_vinculo IS NOT NULL THEN
+        IF v_st_vin <> 'ATIVA' AND NOT v_revog_dep THEN
+            RAISE EXCEPTION 'Vinculo de autorizacao nao esta ATIVA';
+        END IF;
+    ELSE
+        IF aut.status <> 'APROVADA'
+           OR NEW.data_hora_retirada NOT BETWEEN aut.data_inicio AND aut.data_expiracao THEN
+            RAISE EXCEPTION 'Autorizacao temporaria nao aprovada ou fora do periodo';
+        END IF;
+    END IF;
+
+    SELECT al.id_escola, (al.status = 'ATIVO'), u.ativo, es.ativo
+      INTO v_esc_aluno, v_aluno_ok, v_resp_ok, v_escola_ok
+      FROM ALUNO al
+      JOIN ESCOLA es      ON es.id_escola = al.id_escola
+      JOIN RESPONSAVEL r  ON r.id_responsavel = v_id_resp
+      JOIN USUARIO u      ON u.id_usuario = r.id_usuario
+     WHERE al.id_aluno = v_id_aluno;
+
+    IF (v_aluno_ok AND v_resp_ok AND v_escola_ok) IS NOT TRUE THEN
+        RAISE EXCEPTION 'Aluno, responsavel ou escola inativo';
+    END IF;
+
+    SELECT id_escola INTO v_esc_func FROM USUARIO WHERE id_usuario = NEW.id_usuario;
+    IF v_esc_func IS DISTINCT FROM v_esc_aluno THEN
+        RAISE EXCEPTION 'Funcionario pertence a outra escola';
+    END IF;
+
+    IF v_revog_dep THEN
+        NEW.observacao := left(
+            COALESCE(NEW.observacao || ' | ', '') ||
+            'Vinculo revogado apos a leitura offline', 255);
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_registro_qr
+    BEFORE INSERT ON REGISTRO_RETIRADA
+    FOR EACH ROW EXECUTE FUNCTION fn_valida_qr_retirada();
+
+-- 8) Apos a retirada: QR vira USADO (uso unico) e autorizacao temporaria USADA
+CREATE OR REPLACE FUNCTION fn_registro_pos() RETURNS trigger AS $$
+DECLARE
+    v_aut INTEGER;
+BEGIN
+    UPDATE QR_CODE SET status = 'USADO'
+     WHERE id_qrcode = NEW.id_qrcode
+    RETURNING id_autorizacao INTO v_aut;
+
+    IF v_aut IS NOT NULL THEN
+        UPDATE AUTORIZACAO_TEMPORARIA SET status = 'USADA'
+         WHERE id_autorizacao = v_aut;
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_registro_pos
+    AFTER INSERT ON REGISTRO_RETIRADA
+    FOR EACH ROW EXECUTE FUNCTION fn_registro_pos();
+
+-- 9) Revogar vinculo => QR ativos do vinculo viram REVOGADO na hora (RF-11)
+CREATE OR REPLACE FUNCTION fn_revoga_qr_vinculo() RETURNS trigger AS $$
+BEGIN
+    UPDATE QR_CODE SET status = 'REVOGADO'
+     WHERE id_vinculo = NEW.id_vinculo AND status = 'ATIVO';
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_vinculo_revogado
+    AFTER UPDATE ON RESPONSAVEL_ALUNO
+    FOR EACH ROW
+    WHEN (NEW.status_autorizacao = 'REVOGADA' AND OLD.status_autorizacao <> 'REVOGADA')
+    EXECUTE FUNCTION fn_revoga_qr_vinculo();
+
+-- 10) Inativar responsavel => revoga seus QR ativos e autorizacoes
+--     temporarias em aberto (RF-14 / RNFR-14.2)
+CREATE OR REPLACE FUNCTION fn_inativa_responsavel() RETURNS trigger AS $$
+BEGIN
+    UPDATE QR_CODE SET status = 'REVOGADO'
+     WHERE status = 'ATIVO'
+       AND (id_vinculo IN (
+              SELECT ra.id_vinculo
+                FROM RESPONSAVEL_ALUNO ra
+                JOIN RESPONSAVEL r ON r.id_responsavel = ra.id_responsavel
+               WHERE r.id_usuario = NEW.id_usuario)
+         OR id_autorizacao IN (
+              SELECT aut.id_autorizacao
+                FROM AUTORIZACAO_TEMPORARIA aut
+                JOIN RESPONSAVEL r ON r.id_responsavel = aut.id_responsavel
+               WHERE r.id_usuario = NEW.id_usuario));
+
+    UPDATE AUTORIZACAO_TEMPORARIA SET status = 'REVOGADA'
+     WHERE status IN ('PENDENTE','APROVADA')
+       AND id_responsavel IN (
+              SELECT id_responsavel FROM RESPONSAVEL WHERE id_usuario = NEW.id_usuario);
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_usuario_inativado
+    AFTER UPDATE OF ativo ON USUARIO
+    FOR EACH ROW
+    WHEN (OLD.ativo AND NOT NEW.ativo AND NEW.perfil = 'RESPONSAVEL')
+    EXECUTE FUNCTION fn_inativa_responsavel();
+
+-- 11) Aluno deixa de ser ATIVO => revoga QR ativos e autorizacoes
+--     temporarias em aberto dele (RF-14)
+CREATE OR REPLACE FUNCTION fn_inativa_aluno() RETURNS trigger AS $$
+BEGIN
+    UPDATE QR_CODE SET status = 'REVOGADO'
+     WHERE status = 'ATIVO'
+       AND (id_vinculo IN (
+              SELECT id_vinculo FROM RESPONSAVEL_ALUNO WHERE id_aluno = NEW.id_aluno)
+         OR id_autorizacao IN (
+              SELECT id_autorizacao FROM AUTORIZACAO_TEMPORARIA WHERE id_aluno = NEW.id_aluno));
+
+    UPDATE AUTORIZACAO_TEMPORARIA SET status = 'REVOGADA'
+     WHERE id_aluno = NEW.id_aluno AND status IN ('PENDENTE','APROVADA');
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_aluno_inativado
+    AFTER UPDATE OF status ON ALUNO
+    FOR EACH ROW
+    WHEN (OLD.status = 'ATIVO' AND NEW.status <> 'ATIVO')
+    EXECUTE FUNCTION fn_inativa_aluno();
+
+-- 12) LOG_AUDITORIA imutavel (so em manutencao autorizada:
+--     SET LOCAL qrstudy.manutencao = 'on';)
+CREATE OR REPLACE FUNCTION fn_log_imutavel() RETURNS trigger AS $$
+BEGIN
+    IF current_setting('qrstudy.manutencao', true) = 'on' THEN
+        IF TG_OP = 'DELETE' THEN
+            RETURN OLD;
+        END IF;
+        RETURN NEW;
+    END IF;
+    RAISE EXCEPTION 'LOG_AUDITORIA nao pode ser alterada nem apagada';
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_log_imutavel
+    BEFORE UPDATE OR DELETE ON LOG_AUDITORIA
+    FOR EACH ROW EXECUTE FUNCTION fn_log_imutavel();
+
+-- =====================================================================
+-- Itens que ficam na APLICACAO (nao no banco):
+--  * criptografar cpf, cnh e documento_terceiro; gerar cpf_hash
+--  * marcar QR_CODE.status = 'EXPIRADO' (job agendado) apos data_expiracao
+--  * gravar em LOG_AUDITORIA as tentativas de QR negadas e os eventos de
+--    cadastro, edicao, aprovacao, rejeicao, revogacao e delegacao (RF-15)
+--  * tratar a falha de sincronizacao offline (QR ja usado em outra
+--    portaria, QR revogado antes da leitura) e registrar em LOG_AUDITORIA
+--  * bloquear login apos 5 falhas (tentativas_login / bloqueado_ate)
+--  * anonimizar registros apos 5 anos conforme a politica da escola
+-- =====================================================================
+
